@@ -1,31 +1,39 @@
-const axios = require('axios');
+const axios  = require('axios');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const AWS = require('aws-sdk');
+const jwt    = require('jsonwebtoken');
+const AWS    = require('aws-sdk');
+const https  = require('https');
+
+// Постоянное keep-alive соединение — переиспользуется между командами,
+// избегая нового TLS handshake (~200-500ms) на каждый publish
+const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 5, keepAliveMsecs: 60000 });
 
 // ─────────────────────────────────────────────
-// РЕАЛЬНЫЙ МАППИНГ workMode для TAC-BR12INV
-// Проверен через Device Shadow
+// МАППИНГ workMode для TAC-BR12INV
 // ─────────────────────────────────────────────
 const MODE = {
-  AUTO: 0, // Авто
-  COOL: 1, // Охлаждение
-  DRY:  2, // Осушение
-  FAN:  3, // Вентиляция
-  HEAT: 4, // Обогрев
+  AUTO: 0,
+  COOL: 1,
+  DRY:  2,
+  FAN:  3,
+  HEAT: 4,
 };
 
-// windSpeed значения TAC-BR12INV
-// Проверено через Device Shadow при каждом режиме
 const WIND = {
-  AUTO:     0, // Авто
-  SILENT:   2, // Бесшумный
-  LOW:      2, // Низкая (совпадает с Бесшумный)
-  MED_LOW:  3, // Ниже средней
-  MED:      4, // Средняя
-  MED_HIGH: 5, // Выше средней
-  HIGH:     6, // Высокая
-  TURBO:    6, // Turbo (совпадает с Высокая)
+  AUTO:     0,
+  SILENT:   2,
+  LOW:      2,
+  MED_LOW:  3,
+  MED:      4,
+  MED_HIGH: 5,
+  HIGH:     6,
+  TURBO:    6,
+};
+
+const TIMEOUTS = {
+  HTTP:        10000,
+  IOT_SHADOW:   6000,
+  HOMEKIT_GET:  5000,
 };
 
 module.exports = (homebridge) => {
@@ -33,16 +41,30 @@ module.exports = (homebridge) => {
 };
 
 // ─────────────────────────────────────────────
+// ВСПОМОГАТЕЛЬНЫЕ
+// ─────────────────────────────────────────────
+function withTimeout(promise, ms, label) {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Timeout: ${label} (${ms}ms)`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+}
+
+function errMsg(e) {
+  return e?.message || e?.code || (typeof e === 'string' ? e : JSON.stringify(e)) || 'unknown error';
+}
+
+// ─────────────────────────────────────────────
 // ПЛАТФОРМА
 // ─────────────────────────────────────────────
 class TclHomePlatform {
   constructor(log, config, api) {
-    this.log = log;
-    this.config = config;
-    this.api = api;
+    this.log         = log;
+    this.config      = config;
+    this.api         = api;
     this.accessories = [];
 
-    if (!config || !config.username || !config.password) {
+    if (!config?.username || !config?.password) {
       this.log.error('❌ Username and password are required in config');
       return;
     }
@@ -62,7 +84,7 @@ class TclHomePlatform {
 
   async discoverDevices() {
     const MAX_RETRIES = 5;
-    const RETRY_DELAY = 15000; // 15 секунд между попытками
+    const RETRY_DELAY = 15000;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -73,9 +95,9 @@ class TclHomePlatform {
         for (const device of devices) {
           if (device.category === 'AC') this.addAccessory(device);
         }
-        return; // успех — выходим
+        return;
       } catch (err) {
-        this.log.warn(`⚠️ discoverDevices attempt ${attempt}/${MAX_RETRIES}: ${err.message}`);
+        this.log.warn(`⚠️ discoverDevices attempt ${attempt}/${MAX_RETRIES}: ${errMsg(err)}`);
         if (attempt < MAX_RETRIES) {
           this.log.info(`⏳ Retrying in ${RETRY_DELAY / 1000}s...`);
           await new Promise(r => setTimeout(r, RETRY_DELAY));
@@ -89,17 +111,27 @@ class TclHomePlatform {
   addAccessory(device) {
     const uuid     = this.api.hap.uuid.generate(device.deviceId);
     const existing = this.accessories.find(a => a.UUID === uuid);
+
     if (existing) {
-      new TclAirConditioner(this, existing, device);
+      // Защита от дублирования startPolling при повторном discoverDevices
+      if (!existing._acInitialized) {
+        existing._acInitialized = true;
+        new TclAirConditioner(this, existing, device);
+      } else {
+        this.log.info(`♻️ ${device.deviceName} already initialized, skipping`);
+      }
     } else {
       const acc = new this.api.platformAccessory(device.deviceName, uuid);
+      acc._acInitialized = true;
       new TclAirConditioner(this, acc, device);
       this.api.registerPlatformAccessories('homebridge-tcl-split-ac', 'TclHome', [acc]);
       this.accessories.push(acc);
     }
   }
 
-  configureAccessory(acc) { this.accessories.push(acc); }
+  configureAccessory(acc) {
+    this.accessories.push(acc);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -108,15 +140,18 @@ class TclHomePlatform {
 class TclHomeApi {
   constructor(config) {
     Object.assign(this, config);
-    this.authData         = null;
-    this.cloudUrlsData    = null;
-    this.refreshTokensData = null;
-    this.awsCredentials   = null;
-    this.iotData          = null;
-    this.stateCache       = {};
-    this.lastCall         = {};
-    this.authRetry        = 0;
-    this.maxAuthRetry     = 3;
+    this.authData            = null;
+    this.cloudUrlsData       = null;
+    this.refreshTokensData   = null;
+    this.awsCredentials      = null;
+    this.iotData             = null;
+    this.stateCache          = {};
+    this.lastCall            = {};
+    this.authRetry           = 0;
+    this.maxAuthRetry        = 3;
+    this._reAuthInProgress   = false;
+    this._reAuthPromise      = null;  // единый Promise — защита от параллельных reAuth
+    this._credRefreshStarted = false;
   }
 
   dbg(msg, ...a) { if (this.debugMode) this.log.info(`[DBG] ${msg}`, ...a); }
@@ -127,24 +162,28 @@ class TclHomeApi {
     await this.fetchCloudUrls();
     await this.refreshTokens();
     await this.fetchAwsCredentials();
-    await this.setupIot();
+    this.setupIot();
     this.log.info('✅ TCL API ready');
   }
 
   async authenticate() {
     const passHash = crypto.createHash('md5').update(this.password).digest('hex');
-    const resp = await axios.post(this.appLoginUrl, {
-      equipment: 2, password: passHash, osType: 1,
-      username: this.username, clientVersion: '4.8.1',
-      osVersion: '6.0', deviceModel: 'AndroidAndroid SDK built for x86',
-      captchaRule: 2, channel: 'app',
-    }, {
-      headers: {
-        'th_platform': 'android', 'th_version': '4.8.1',
-        'th_appbulid': '830', 'user-agent': 'Android',
-        'content-type': 'application/json; charset=UTF-8',
-      },
-    });
+    const resp = await withTimeout(
+      axios.post(this.appLoginUrl, {
+        equipment: 2, password: passHash, osType: 1,
+        username: this.username, clientVersion: '4.8.1',
+        osVersion: '6.0', deviceModel: 'AndroidAndroid SDK built for x86',
+        captchaRule: 2, channel: 'app',
+      }, {
+        timeout: TIMEOUTS.HTTP,
+        headers: {
+          'th_platform': 'android', 'th_version': '4.8.1',
+          'th_appbulid': '830', 'user-agent': 'Android',
+          'content-type': 'application/json; charset=UTF-8',
+        },
+      }),
+      TIMEOUTS.HTTP, 'authenticate'
+    );
     if (resp.data.status !== 1) throw new Error('Auth failed: ' + resp.data.msg);
     this.authData  = resp.data;
     this.authRetry = 0;
@@ -152,61 +191,90 @@ class TclHomeApi {
   }
 
   async fetchCloudUrls() {
-    const resp = await axios.post(this.cloudUrls, {
-      ssoId:    this.authData.user.username,
-      ssoToken: this.authData.token,
-    }, { headers: { 'user-agent': 'Android', 'content-type': 'application/json; charset=UTF-8' } });
+    const resp = await withTimeout(
+      axios.post(this.cloudUrls, {
+        ssoId:    this.authData.user.username,
+        ssoToken: this.authData.token,
+      }, {
+        timeout: TIMEOUTS.HTTP,
+        headers: { 'user-agent': 'Android', 'content-type': 'application/json; charset=UTF-8' },
+      }),
+      TIMEOUTS.HTTP, 'fetchCloudUrls'
+    );
     this.cloudUrlsData = resp.data;
   }
 
   async refreshTokens() {
     const url  = `${this.cloudUrlsData.data.cloud_url}/v3/auth/refresh_tokens`;
-    const resp = await axios.post(url, {
-      userId:   this.authData.user.username,
-      ssoToken: this.authData.token,
-      appId:    this.appId,
-    }, {
-      headers: {
-        'user-agent': 'Android',
-        'content-type': 'application/json; charset=UTF-8',
-        'accept-encoding': 'gzip, deflate, br',
-      },
-    });
+    const resp = await withTimeout(
+      axios.post(url, {
+        userId:   this.authData.user.username,
+        ssoToken: this.authData.token,
+        appId:    this.appId,
+      }, {
+        timeout: TIMEOUTS.HTTP,
+        headers: { 'user-agent': 'Android', 'content-type': 'application/json; charset=UTF-8' },
+      }),
+      TIMEOUTS.HTTP, 'refreshTokens'
+    );
     this.refreshTokensData = resp.data;
   }
 
   async fetchAwsCredentials() {
+    // Обновляем cognitoToken перед получением AWS ключей
+    // Вызывается только из refreshCredentials() — не из initialize()
+    // чтобы не делать двойной refreshTokens при полной инициализации
     const region  = this.cloudUrlsData.data.cloud_region;
+
+    // Защита от невалидного JWT
     const decoded = jwt.decode(this.refreshTokensData.data.cognitoToken);
-    const resp    = await axios.post(
-      `https://cognito-identity.${region}.amazonaws.com/`,
-      {
-        IdentityId: decoded.sub,
-        Logins: { 'cognito-identity.amazonaws.com': this.refreshTokensData.data.cognitoToken },
-      },
-      {
-        headers: {
-          'User-agent': 'aws-sdk-android/2.22.6 Linux/6.1.23 Dalvik/2.1.0/0 en_US',
-          'X-Amz-Target': 'AWSCognitoIdentityService.GetCredentialsForIdentity',
-          'content-type': 'application/x-amz-json-1.1',
+    if (!decoded?.sub) throw new Error('Invalid cognitoToken: failed to decode JWT');
+
+    const resp = await withTimeout(
+      axios.post(
+        `https://cognito-identity.${region}.amazonaws.com/`,
+        {
+          IdentityId: decoded.sub,
+          Logins: { 'cognito-identity.amazonaws.com': this.refreshTokensData.data.cognitoToken },
         },
-      },
+        {
+          timeout: TIMEOUTS.HTTP,
+          headers: {
+            'User-agent': 'aws-sdk-android/2.22.6 Linux/6.1.23 Dalvik/2.1.0/0 en_US',
+            'X-Amz-Target': 'AWSCognitoIdentityService.GetCredentialsForIdentity',
+            'content-type': 'application/x-amz-json-1.1',
+          },
+        }
+      ),
+      TIMEOUTS.HTTP, 'fetchAwsCredentials'
     );
     this.awsCredentials = resp.data;
     this.log.info('✅ AWS credentials OK');
   }
 
-  async setupIot() {
+  setupIot() {
     const region = this.cloudUrlsData.data.cloud_region;
     const creds  = this.awsCredentials.Credentials;
-    AWS.config.update({
+
+    // AWS Cognito возвращает SecretKey, AWS SDK ожидает secretAccessKey
+    // Поддерживаем оба варианта поля на случай изменений в API
+    const secretKey = creds.SecretAccessKey || creds.SecretKey;
+
+    if (!creds.AccessKeyId || !secretKey || !creds.SessionToken) {
+      this.log.error('❌ setupIot: missing credentials fields:', JSON.stringify(Object.keys(creds)));
+      throw new Error('Invalid AWS credentials structure');
+    }
+
+    this.dbg('🔑 Credentials fields:', Object.keys(creds).join(', '));
+
+    this.iotData = new AWS.IotData({
+      endpoint:        `https://data-ats.iot.${region}.amazonaws.com`,
       accessKeyId:     creds.AccessKeyId,
-      secretAccessKey: creds.SecretKey,
+      secretAccessKey: secretKey,
       sessionToken:    creds.SessionToken,
       region,
-    });
-    this.iotData = new AWS.IotData({
-      endpoint: `https://data-ats.iot.${region}.amazonaws.com`,
+      maxRetries:      0,                                    // retry только наш, не SDK
+      httpOptions:     { timeout: 5000, connectTimeout: 3000, agent: keepAliveAgent },
     });
     this.log.info('✅ AWS IoT ready');
   }
@@ -216,49 +284,66 @@ class TclHomeApi {
     const timestamp = Date.now().toString();
     const nonce     = Math.random().toString(36).substr(2, 16);
     const sign      = this.md5(timestamp + nonce + this.refreshTokensData.data.saasToken);
-    const resp      = await axios.post(url, {}, {
-      headers: {
-        platform: 'android', appversion: '5.4.1', thomeversion: '4.8.1',
-        accesstoken: this.refreshTokensData.data.saasToken,
-        countrycode: this.authData.user.countryAbbr,
-        'accept-language': 'en', timestamp, nonce, sign,
-        'user-agent': 'Android', 'content-type': 'application/json; charset=UTF-8',
-        'accept-encoding': 'gzip, deflate, br',
-      },
-    });
+    const resp      = await withTimeout(
+      axios.post(url, {}, {
+        timeout: TIMEOUTS.HTTP,
+        headers: {
+          platform: 'android', appversion: '5.4.1', thomeversion: '4.8.1',
+          accesstoken: this.refreshTokensData.data.saasToken,
+          countrycode: this.authData.user.countryAbbr,
+          'accept-language': 'en', timestamp, nonce, sign,
+          'user-agent': 'Android', 'content-type': 'application/json; charset=UTF-8',
+        },
+      }),
+      TIMEOUTS.HTTP, 'getDevices'
+    );
     return resp.data.data || [];
   }
 
   async getDeviceState(deviceId, force = false) {
     const now = Date.now();
+
+    // Дебаунс: не дёргаем AWS чаще 200мс
     if (!force && this.lastCall[deviceId] && now - this.lastCall[deviceId] < 200) {
       return this.stateCache[deviceId] || this.defaultState();
     }
     this.lastCall[deviceId] = now;
+
+    // Ждём reAuth если он идёт — не шлём запросы с мёртвыми credentials
+    if (this._reAuthInProgress && this._reAuthPromise) {
+      this.dbg('⏳ Waiting for reAuth before reading shadow...');
+      try { await this._reAuthPromise; } catch (_) {}
+      force = true;
+    }
+
     if (!this.iotData) return this.stateCache[deviceId] || this.defaultState();
 
     try {
-      const result = await this.iotData.getThingShadow({ thingName: deviceId }).promise();
+      const result = await withTimeout(
+        this.iotData.getThingShadow({ thingName: deviceId }).promise(),
+        TIMEOUTS.IOT_SHADOW, 'getThingShadow'
+      );
       const shadow = JSON.parse(result.payload.toString());
       const rep    = shadow.state?.reported || {};
 
       const state = {
-        powerSwitch:        rep.powerSwitch        ?? 0,
-        workMode:           rep.workMode           ?? MODE.COOL,
-        windSpeed:          rep.windSpeed          ?? WIND.AUTO,
+        powerSwitch:        rep.powerSwitch         ?? 0,
+        workMode:           rep.workMode            ?? MODE.COOL,
+        windSpeed:          rep.windSpeed           ?? WIND.AUTO,
         targetTemperature:  rep.targetCelsiusDegree ?? rep.targetTemperature ?? 22,
-        currentTemperature: rep.currentTemperature ?? 22,
-        minTemp:            rep.lowerTemperatureLimit  ?? 16,
-        maxTemp:            rep.upperTemperatureLimit  ?? 31,
+        currentTemperature: rep.currentTemperature,  // undefined = нет данных с датчика
+        minTemp:            rep.lowerTemperatureLimit ?? 16,
+        maxTemp:            rep.upperTemperatureLimit ?? 31,
         isOnline:           true,
         lastUpdated:        now,
       };
 
-      this.dbg(`📊 ${deviceId}: power=${state.powerSwitch} mode=${state.workMode} wind=${state.windSpeed} target=${state.targetTemperature}°C room=${state.currentTemperature}°C`);
+      this.dbg(`📊 ${deviceId}: power=${state.powerSwitch} mode=${state.workMode} wind=${state.windSpeed} target=${state.targetTemperature}°C room=${state.currentTemperature ?? '?'}°C`);
       this.stateCache[deviceId] = state;
       return state;
+
     } catch (err) {
-      this.dbg('⚠️ Shadow read failed:', err.message);
+      this.dbg('⚠️ Shadow read failed:', errMsg(err));
       const cached = this.stateCache[deviceId];
       if (cached && now - cached.lastUpdated > 30000) {
         delete this.stateCache[deviceId];
@@ -271,71 +356,120 @@ class TclHomeApi {
   defaultState() {
     return {
       powerSwitch: 0, workMode: MODE.COOL, windSpeed: WIND.AUTO,
-      targetTemperature: 22, currentTemperature: 22,
+      targetTemperature: 22, currentTemperature: undefined,
       minTemp: 16, maxTemp: 31, isOnline: false, lastUpdated: Date.now(),
     };
   }
 
   async sendCommand(deviceId, props) {
     if (!this.iotData) { this.log.error('❌ IoT not initialized'); return false; }
+
+    // Ждём reAuth перед отправкой команды
+    if (this._reAuthInProgress && this._reAuthPromise) {
+      this.log.info('⏳ Waiting for reAuth before sending command...');
+      try { await this._reAuthPromise; } catch (_) {}
+    }
+
     const topic   = `$aws/things/${deviceId}/shadow/update`;
     const payload = JSON.stringify({ state: { desired: props }, clientToken: `hb_${Date.now()}` });
-    this.log.info(`📡 → ${deviceId}:`, JSON.stringify(props));
-    try {
-      await this.iotData.publish({ topic, payload, qos: 1 }).promise();
-      if (this.stateCache[deviceId]) {
-        Object.assign(this.stateCache[deviceId], props);
-        if (props.targetCelsiusDegree !== undefined)
-          this.stateCache[deviceId].targetTemperature = props.targetCelsiusDegree;
+    this.log.info(`📡 → ${deviceId}: ${JSON.stringify(props)}`);
+
+    // Один уровень retry — 2 попытки, короткий таймаут каждая
+    const MAX_ATTEMPTS = 2;
+    const PUBLISH_TIMEOUT = 4000;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        await withTimeout(
+          this.iotData.publish({ topic, payload, qos: 0 }).promise(),
+          PUBLISH_TIMEOUT, 'publish'
+        );
+
+        // Оптимистично обновляем кэш
+        if (this.stateCache[deviceId]) {
+          Object.assign(this.stateCache[deviceId], props);
+          if (props.targetCelsiusDegree !== undefined)
+            this.stateCache[deviceId].targetTemperature = props.targetCelsiusDegree;
+        }
+
+        this.log.info(`✅ Command sent (attempt ${attempt})`);
+        return true;
+
+      } catch (err) {
+        const msg = errMsg(err);
+        this.log.warn(`⚠️ Publish attempt ${attempt}/${MAX_ATTEMPTS} failed: ${msg}`);
+
+        if (msg.includes('Forbidden') || msg.includes('expired') || msg.includes('InvalidToken')) {
+          this.log.warn('🔄 Credentials expired, triggering reAuth...');
+          await this.reAuth();
+          return false;
+        }
+        // без задержки между попытками — keep-alive соединение уже установлено
       }
-      this.log.info('✅ Command sent');
-      return true;
-    } catch (err) {
-      if (err.message.includes('Forbidden') || err.message.includes('expired')) {
-        this.log.warn('🔄 Credentials expired, re-authenticating...');
-        await this.reAuth();
-        return false;
-      }
-      this.log.error('❌ Publish failed:', err.message);
-      return false;
     }
+
+    this.log.error('❌ Publish failed after all attempts');
+    return false;
   }
 
-  async reAuth() {
+  // Единый Promise — параллельные вызовы reAuth получают один и тот же
+  reAuth() {
+    if (this._reAuthPromise) {
+      this.dbg('ℹ️ reAuth already in progress, reusing promise');
+      return this._reAuthPromise;
+    }
+
+    this._reAuthPromise = this._doReAuth().finally(() => {
+      this._reAuthPromise    = null;
+      this._reAuthInProgress = false;
+    });
+
+    return this._reAuthPromise;
+  }
+
+  async _doReAuth() {
     if (this.authRetry >= this.maxAuthRetry) {
-      this.log.error('❌ Max re-auth attempts. Restart Homebridge.');
-      this.authRetry = 0; // сбрасываем чтобы следующий цикл мог попробовать снова
+      this.log.error('❌ Max re-auth attempts reached. Will retry on next poll error.');
+      this.authRetry = 0;
       return;
     }
     this.authRetry++;
+    this._reAuthInProgress = true;
     this.log.info(`🔄 Re-auth attempt ${this.authRetry}/${this.maxAuthRetry}`);
 
     const MAX_RETRIES = 3;
-    const RETRY_DELAY = 20000; // 20 секунд между попытками при DNS ошибке
+    const RETRY_DELAY = 20000;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         await this.initialize();
         this.authRetry = 0;
-        return; // успех
+        this.log.info('✅ Re-auth successful');
+        return;
       } catch (err) {
-        const msg = err?.message || '';
-        const isDnsErr = msg.includes('EAI_AGAIN')
-          || msg.includes('ENOTFOUND')
-          || msg.includes('ECONNREFUSED')
-          || msg.includes('ETIMEDOUT');
-
+        const msg = errMsg(err);
         this.log.error(`❌ Re-auth attempt ${attempt}/${MAX_RETRIES} failed: ${msg}`);
-
-        if (isDnsErr && attempt < MAX_RETRIES) {
-          this.log.info(`⏳ DNS error, retrying in ${RETRY_DELAY / 1000}s...`);
+        if (attempt < MAX_RETRIES) {
+          this.log.info(`⏳ Retrying in ${RETRY_DELAY / 1000}s...`);
           await new Promise(r => setTimeout(r, RETRY_DELAY));
-        } else if (attempt >= MAX_RETRIES) {
-          this.log.error('❌ Re-auth failed after all retries. Will try again on next poll error.');
-        } else {
-          break; // не DNS ошибка — не ретраим
         }
       }
+    }
+    this.log.error('❌ Re-auth failed after all retries. Will retry on next poll cycle.');
+  }
+
+  // Обновление только AWS части каждые 50 минут
+  // refreshTokens вызывается один раз здесь — не дублируется
+  async refreshCredentials() {
+    this.log.info('🔑 Refreshing AWS credentials...');
+    try {
+      await this.refreshTokens();       // обновляем cognitoToken
+      await this.fetchAwsCredentials(); // получаем новые AWS ключи
+      this.setupIot();                  // пересоздаём IoT клиент
+      this.log.info('✅ AWS credentials refreshed');
+    } catch (err) {
+      this.log.error('❌ Credentials refresh failed:', errMsg(err));
+      await this.reAuth(); // fallback: полный re-initialize
     }
   }
 
@@ -350,7 +484,7 @@ class TclHomeApi {
 // ─────────────────────────────────────────────
 class TclAirConditioner {
   constructor(platform, accessory, device) {
-    this.platform = platform;
+    this.platform  = platform;
     this.accessory = accessory;
     this.device    = device;
     this.log       = platform.log;
@@ -363,8 +497,13 @@ class TclAirConditioner {
     this._maxTemp       = 31;
     this._errCount      = 0;
     this._lastOkPoll    = Date.now();
-    this._lastHkUpdate  = 0;
     this._lastStateKey  = '';
+    this._lastKnownTemp = undefined;
+
+    // Очередь команд — последовательная отправка + защита от дублей
+    this.commandQueue     = Promise.resolve();
+    this._lastCommandKey  = null;
+    this._lastCommandTime = 0;
 
     this.setupAccessoryInfo();
     this.setupThermostat();
@@ -420,7 +559,10 @@ class TclAirConditioner {
     const names = ['Sleep Mode', 'Fan Speed', 'Fan Mode', 'Cool Fan Speed', 'AC Fan', 'Fan Speed Control'];
     for (const name of names) {
       const svc = this.accessory.getService(name);
-      if (svc) { this.accessory.removeService(svc); this.log.info(`🗑️ Removed legacy service: ${name}`); }
+      if (svc) {
+        this.accessory.removeService(svc);
+        this.log.info(`🗑️ Removed legacy service: ${name}`);
+      }
     }
   }
 
@@ -440,20 +582,27 @@ class TclAirConditioner {
   }
 
   // ─────────────────────────────────────────────
-  // ГЕТТЕРЫ
+  // ГЕТТЕРЫ — читают из кэша, поллинг держит его свежим
   // ─────────────────────────────────────────────
   async getCurrentMode() {
     try {
-      const s = await this.api.getDeviceState(this.device.deviceId);
+      const s = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getCurrentMode'
+      );
       if (!s.powerSwitch) return this.hap.Characteristic.CurrentHeatingCoolingState.OFF;
-      if (s.workMode === MODE.HEAT) return this.hap.Characteristic.CurrentHeatingCoolingState.HEAT;
-      return this.hap.Characteristic.CurrentHeatingCoolingState.COOL;
+      return s.workMode === MODE.HEAT
+        ? this.hap.Characteristic.CurrentHeatingCoolingState.HEAT
+        : this.hap.Characteristic.CurrentHeatingCoolingState.COOL;
     } catch (e) { return this.hap.Characteristic.CurrentHeatingCoolingState.OFF; }
   }
 
   async getTargetMode() {
     try {
-      const s = await this.api.getDeviceState(this.device.deviceId);
+      const s = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getTargetMode'
+      );
       if (!s.powerSwitch) return this.hap.Characteristic.TargetHeatingCoolingState.OFF;
       return this.workModeToHk(s.workMode);
     } catch (e) { return this.hap.Characteristic.TargetHeatingCoolingState.OFF; }
@@ -461,79 +610,145 @@ class TclAirConditioner {
 
   async getCurrentTemp() {
     try {
-      // force=true — всегда идём напрямую в AWS Shadow, минуя кэш
-      const s = await this.api.getDeviceState(this.device.deviceId, true);
-      return s.currentTemperature ?? 22;
-    } catch (e) { return 22; }
+      const s = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getCurrentTemp'
+      );
+      if (s.currentTemperature !== undefined) {
+        this._lastKnownTemp = s.currentTemperature;
+        return s.currentTemperature;
+      }
+      // null запрещён в HomeKit — возвращаем последнее известное или 0 как минимально безопасное
+      return this._lastKnownTemp ?? 0;
+    } catch (e) {
+      return this._lastKnownTemp ?? 0;
+    }
   }
 
   async getTargetTemp() {
     try {
-      const s = await this.api.getDeviceState(this.device.deviceId);
+      const s = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getTargetTemp'
+      );
       return s.targetTemperature ?? 22;
     } catch (e) { return 22; }
   }
 
   async getFanActive() {
     try {
-      const s = await this.api.getDeviceState(this.device.deviceId);
+      const s = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getFanActive'
+      );
       return s.powerSwitch === 1;
     } catch (e) { return false; }
   }
 
   async getFanSpeed() {
     try {
-      const s = await this.api.getDeviceState(this.device.deviceId);
+      const s = await withTimeout(
+        this.api.getDeviceState(this.device.deviceId, false),
+        TIMEOUTS.HOMEKIT_GET, 'getFanSpeed'
+      );
       if (!s.powerSwitch) return 0;
       return this.windToPercent(s.windSpeed);
     } catch (e) { return 0; }
   }
 
   // ─────────────────────────────────────────────
-  // СЕТТЕРЫ
+  // ОЧЕРЕДЬ КОМАНД
+  // Предотвращает спам при быстрых нажатиях в HomeKit.
+  // Сбрасываем ссылку после выполнения чтобы не копить Promise-цепочку.
+  // ─────────────────────────────────────────────
+  queueCommand(props, ctx) {
+    // Защита от дублей — HomeKit иногда присылает одну команду дважды подряд
+    const commandKey = JSON.stringify(props);
+    if (this._lastCommandKey === commandKey &&
+        Date.now() - this._lastCommandTime < 3000) {
+      this.log.info(`⏭️ Duplicate command skipped: ${ctx}`);
+      return Promise.resolve(true);
+    }
+    this._lastCommandKey  = commandKey;
+    this._lastCommandTime = Date.now();
+
+    // Без искусственной задержки — keep-alive держит соединение готовым.
+    // Очередь нужна только чтобы не отправлять параллельно несколько publish.
+    const next = this.commandQueue
+      .then(() => this.sendOnce(props, ctx))
+      .catch(e => this.log.error(`❌ Command queue error (${ctx}):`, errMsg(e)));
+
+    this.commandQueue = next.then(() => {}, () => {});
+    return next;
+  }
+
+  // Один уровень — retry уже реализован внутри api.sendCommand (2 попытки)
+  async sendOnce(props, ctx) {
+    const ok = await this.api.sendCommand(this.device.deviceId, props);
+    if (ok) {
+      // Читаем актуальное состояние через 1.2 сек после команды
+      setTimeout(async () => {
+        try {
+          const ns = await this.api.getDeviceState(this.device.deviceId, true);
+          if (ns) this.updateFromState(ns);
+        } catch (e) {}
+      }, 1200);
+      return true;
+    }
+    this.log.error(`❌ ${ctx} failed`);
+    return false;
+  }
+
+  // ─────────────────────────────────────────────
+  // СЕТТЕРЫ — все обёрнуты в try/catch
   // ─────────────────────────────────────────────
   async setTargetMode(value) {
-    const C = this.hap.Characteristic;
+    const C         = this.hap.Characteristic;
     const modeNames = ['OFF', 'COOL', 'HEAT', 'AUTO'];
-    this.log.info(`🎯 setTargetMode → ${modeNames[value]}`);
-    const cur  = await this.api.getDeviceState(this.device.deviceId, true);
-    const temp = cur.targetTemperature ?? 22;
-    const wind = cur.windSpeed ?? this._lastWindSpeed;
-    let props;
-    switch (value) {
-      case C.TargetHeatingCoolingState.OFF:
-        props = { powerSwitch: 0 };
-        break;
-      case C.TargetHeatingCoolingState.COOL:
-        this._lastMode = MODE.COOL;
-        props = { powerSwitch: 1, workMode: MODE.COOL, windSpeed: wind,
-                  targetCelsiusDegree: temp, targetTemperature: temp,
-                  ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
-        break;
-      case C.TargetHeatingCoolingState.HEAT:
-        this._lastMode = MODE.HEAT;
-        props = { powerSwitch: 1, workMode: MODE.HEAT, windSpeed: wind,
-                  targetCelsiusDegree: temp, targetTemperature: temp,
-                  ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
-        break;
-      case C.TargetHeatingCoolingState.AUTO:
-        this._lastMode = MODE.AUTO;
-        props = { powerSwitch: 1, workMode: MODE.AUTO, windSpeed: wind,
-                  targetCelsiusDegree: temp, targetTemperature: temp,
-                  ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
-        break;
-      default:
-        this.log.warn(`⚠️ Unknown HomeKit mode: ${value}`);
-        return;
+    try {
+      this.log.info(`🎯 setTargetMode → ${modeNames[value] ?? value}`);
+      const cur  = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+      const temp = cur.targetTemperature ?? 22;
+      const wind = cur.windSpeed         ?? this._lastWindSpeed;
+      let props;
+
+      switch (value) {
+        case C.TargetHeatingCoolingState.OFF:
+          props = { powerSwitch: 0 };
+          break;
+        case C.TargetHeatingCoolingState.HEAT:
+          this._lastMode = MODE.HEAT;
+          props = { powerSwitch: 1, workMode: MODE.HEAT, windSpeed: wind,
+                    targetCelsiusDegree: temp, targetTemperature: temp,
+                    ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+          break;
+        case C.TargetHeatingCoolingState.AUTO:
+          this._lastMode = MODE.AUTO;
+          props = { powerSwitch: 1, workMode: MODE.AUTO, windSpeed: wind,
+                    targetCelsiusDegree: temp, targetTemperature: temp,
+                    ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+          break;
+        case C.TargetHeatingCoolingState.COOL:
+        default:
+          this._lastMode = MODE.COOL;
+          props = { powerSwitch: 1, workMode: MODE.COOL, windSpeed: wind,
+                    targetCelsiusDegree: temp, targetTemperature: temp,
+                    ECO: 0, sleep: 0, turbo: 0, silenceSwitch: 0 };
+          break;
+      }
+      await this.queueCommand(props, 'setTargetMode');
+    } catch (e) {
+      this.log.error('❌ setTargetMode:', errMsg(e));
+      throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
-    await this.sendWithRetry(props, 'setTargetMode');
   }
 
   async setTargetTemp(value) {
     try {
       const temp = Math.max(this._minTemp, Math.min(this._maxTemp, Math.round(value)));
-      const cur  = await this.api.getDeviceState(this.device.deviceId, true);
+      const cur  = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
       this.log.info(`🌡️ setTargetTemp → ${temp}°C (power=${cur.powerSwitch}, mode=${cur.workMode})`);
+
       let props;
       if (!cur.powerSwitch) {
         props = { powerSwitch: 1, workMode: this._lastMode, windSpeed: this._lastWindSpeed,
@@ -541,74 +756,90 @@ class TclAirConditioner {
       } else {
         props = { targetCelsiusDegree: temp, targetTemperature: temp };
       }
-      const ok = await this.sendWithRetry(props, 'setTargetTemp');
-      if (ok) {
-        this.thermo.getCharacteristic(this.hap.Characteristic.TargetTemperature).updateValue(temp);
-      }
+
+      await this.queueCommand(props, 'setTargetTemp');
+      this.thermo.getCharacteristic(this.hap.Characteristic.TargetTemperature).updateValue(temp);
     } catch (e) {
-      this.log.error('❌ setTargetTemp:', e.message);
+      this.log.error('❌ setTargetTemp:', errMsg(e));
       throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
   }
 
   async setFanActive(value) {
-    this.log.info(`💨 setFanActive → ${value ? 'ON' : 'OFF'}`);
-    if (!value) {
-      await this.sendWithRetry({ powerSwitch: 0 }, 'setFanActive:off');
-    } else {
-      const cur = await this.api.getDeviceState(this.device.deviceId, true);
-      if (!cur.powerSwitch) {
-        await this.sendWithRetry({ powerSwitch: 1, workMode: this._lastMode, windSpeed: this._lastWindSpeed }, 'setFanActive:on');
+    try {
+      this.log.info(`💨 setFanActive → ${value ? 'ON' : 'OFF'}`);
+      if (!value) {
+        await this.queueCommand({ powerSwitch: 0 }, 'setFanActive:off');
+      } else {
+        const cur = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+        if (!cur.powerSwitch) {
+          await this.queueCommand(
+            { powerSwitch: 1, workMode: this._lastMode, windSpeed: this._lastWindSpeed },
+            'setFanActive:on'
+          );
+        }
       }
+    } catch (e) {
+      this.log.error('❌ setFanActive:', errMsg(e));
+      throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
   }
 
   async setFanSpeed(value) {
     try {
-      const wind      = this.percentToWind(value);
+      const wind          = this.percentToWind(value);
       this._lastWindSpeed = wind;
-      const cur       = await this.api.getDeviceState(this.device.deviceId, true);
-      const windNames = { 0:'Авто', 2:'Бесшумный/Низкая', 3:'Ниже средней', 4:'Средняя', 5:'Выше средней', 6:'Высокая/Turbo' };
-      this.log.info(`💨 setFanSpeed → ${value}% → windSpeed=${wind} (${windNames[wind]}) | power=${cur.powerSwitch} mode=${cur.workMode}`);
+      const cur           = this.api.stateCache[this.device.deviceId] || this.api.defaultState();
+      const windNames     = { 0:'Авто', 2:'Бесшумный', 3:'Ниже средней', 4:'Средняя', 5:'Выше средней', 6:'Высокая' };
+      this.log.info(`💨 setFanSpeed → ${value}% → wind=${wind} (${windNames[wind]}) | power=${cur.powerSwitch}`);
       if (!cur.powerSwitch) { this.log.info('💨 Device is off, speed saved for next start'); return; }
-      await this.sendWithRetry({ windSpeed: wind }, 'setFanSpeed');
+      await this.queueCommand({ windSpeed: wind }, 'setFanSpeed');
     } catch (e) {
-      this.log.error('❌ setFanSpeed:', e.message);
+      this.log.error('❌ setFanSpeed:', errMsg(e));
       throw new this.hap.HapStatusError(this.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
   }
 
   // ─────────────────────────────────────────────
-  // ОБНОВЛЕНИЕ HOMEKIT ИЗ СОСТОЯНИЯ УСТРОЙСТВА
+  // ОБНОВЛЕНИЕ HOMEKIT
   // ─────────────────────────────────────────────
   updateFromState(s) {
     const key = `${s.powerSwitch}-${s.workMode}-${s.windSpeed}-${s.currentTemperature}-${s.targetTemperature}`;
     if (key === this._lastStateKey) return;
-    const major = !this._lastStateKey
-      || this._lastStateKey.split('-')[0] !== String(s.powerSwitch)
-      || this._lastStateKey.split('-')[1] !== String(s.workMode);
-    if (!major && Date.now() - this._lastHkUpdate < 500) return;
     this._lastStateKey = key;
-    this._lastHkUpdate = Date.now();
-    if (major) {
-      this.log.info(`📈 power=${s.powerSwitch} mode=${s.workMode} wind=${s.windSpeed} room=${s.currentTemperature}°C target=${s.targetTemperature}°C`);
-    }
-    if (s.powerSwitch && s.workMode !== undefined) this._lastMode = s.workMode;
-    if (s.windSpeed !== undefined) this._lastWindSpeed = s.windSpeed;
-    if (s.minTemp) this._minTemp = s.minTemp;
-    if (s.maxTemp) this._maxTemp = s.maxTemp;
+
+    this.log.info(`📈 power=${s.powerSwitch} mode=${s.workMode} wind=${s.windSpeed} room=${s.currentTemperature ?? '?'}°C target=${s.targetTemperature}°C`);
+
+    if (s.powerSwitch && s.workMode !== undefined) this._lastMode      = s.workMode;
+    if (s.windSpeed  !== undefined)                this._lastWindSpeed = s.windSpeed;
+    if (s.minTemp)                                 this._minTemp       = s.minTemp;
+    if (s.maxTemp)                                 this._maxTemp       = s.maxTemp;
+
     const C = this.hap.Characteristic;
-    this.thermo.updateCharacteristic(C.CurrentTemperature, s.currentTemperature ?? 22);
+
+    // Температура: только реальные значения, никогда не заглушки
+    if (s.currentTemperature !== undefined) {
+      this._lastKnownTemp = s.currentTemperature;
+      this.thermo.updateCharacteristic(C.CurrentTemperature, s.currentTemperature);
+    } else if (this._lastKnownTemp !== undefined && this._lastKnownTemp !== null) {
+      this.thermo.updateCharacteristic(C.CurrentTemperature, this._lastKnownTemp);
+    }
+    // Если нет вообще никаких данных — не вызываем updateCharacteristic
+    // HomeKit будет показывать последнее кэшированное значение
+
     if (s.targetTemperature !== undefined)
       this.thermo.updateCharacteristic(C.TargetTemperature, s.targetTemperature);
-    let curMode, tgtMode;
-    if (!s.powerSwitch) {
-      curMode = C.CurrentHeatingCoolingState.OFF;
-      tgtMode = C.TargetHeatingCoolingState.OFF;
-    } else {
-      curMode = s.workMode === MODE.HEAT ? C.CurrentHeatingCoolingState.HEAT : C.CurrentHeatingCoolingState.COOL;
-      tgtMode = this.workModeToHk(s.workMode);
-    }
+
+    const curMode = !s.powerSwitch
+      ? C.CurrentHeatingCoolingState.OFF
+      : s.workMode === MODE.HEAT
+        ? C.CurrentHeatingCoolingState.HEAT
+        : C.CurrentHeatingCoolingState.COOL;
+
+    const tgtMode = !s.powerSwitch
+      ? C.TargetHeatingCoolingState.OFF
+      : this.workModeToHk(s.workMode);
+
     this.thermo.updateCharacteristic(C.CurrentHeatingCoolingState, curMode);
     this.thermo.updateCharacteristic(C.TargetHeatingCoolingState, tgtMode);
     this.fanSvc.updateCharacteristic(C.On, s.powerSwitch === 1);
@@ -616,7 +847,7 @@ class TclAirConditioner {
   }
 
   // ─────────────────────────────────────────────
-  // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+  // ВСПОМОГАТЕЛЬНЫЕ
   // ─────────────────────────────────────────────
   workModeToHk(workMode) {
     const C = this.hap.Characteristic;
@@ -624,9 +855,7 @@ class TclAirConditioner {
       case MODE.COOL: return C.TargetHeatingCoolingState.COOL;
       case MODE.HEAT: return C.TargetHeatingCoolingState.HEAT;
       case MODE.AUTO: return C.TargetHeatingCoolingState.AUTO;
-      case MODE.DRY:  return C.TargetHeatingCoolingState.COOL;
-      case MODE.FAN:  return C.TargetHeatingCoolingState.AUTO;
-      default:        return C.TargetHeatingCoolingState.OFF;
+      default:        return C.TargetHeatingCoolingState.COOL;
     }
   }
 
@@ -651,32 +880,11 @@ class TclAirConditioner {
     return 6;
   }
 
-  async sendWithRetry(props, ctx) {
-    for (let i = 1; i <= 3; i++) {
-      const ok = await this.api.sendCommand(this.device.deviceId, props);
-      if (ok) {
-        setTimeout(async () => {
-          try {
-            const ns = await this.api.getDeviceState(this.device.deviceId, true);
-            if (ns) this.updateFromState(ns);
-          } catch(e) {}
-        }, 2000);
-        return true;
-      }
-      this.log.warn(`⚠️ ${ctx} attempt ${i}/3 failed`);
-      if (i < 3) await new Promise(r => setTimeout(r, 2000 * i));
-    }
-    this.log.error(`❌ ${ctx} failed after 3 attempts`);
-    return false;
-  }
-
   // ─────────────────────────────────────────────
   // ПОЛЛИНГ
   // ─────────────────────────────────────────────
   startPolling() {
-    // Основной поллинг состояния — каждые 3 секунды.
-    // Читает getThingShadow() напрямую с AWS сервера,
-    // получая актуальные данные включая currentTemperature.
+    // Основной поллинг каждые 3 секунды
     setInterval(async () => {
       try {
         const force = Date.now() - this._lastOkPoll > 10000;
@@ -688,14 +896,13 @@ class TclAirConditioner {
         }
       } catch (err) {
         this._errCount++;
-        const msg = err?.message || '';
-        const isAuthErr = msg.includes('Forbidden')
-          || msg.includes('expired')
-          || msg.includes('InvalidToken');
+        const msg       = errMsg(err);
+        // Реагируем на Forbidden сразу, не ждём трёх ошибок
+        const isAuthErr = msg.includes('Forbidden') || msg.includes('expired') || msg.includes('InvalidToken');
         if (isAuthErr || this._errCount >= 3) {
           this.log.warn('🔄 Re-authenticating...');
-          await this.api.reAuth();
           this._errCount = 0;
+          await this.api.reAuth();
         }
       }
     }, 3000).unref();
@@ -709,31 +916,10 @@ class TclAirConditioner {
       }
     }, 30000).unref();
 
-    // Обновление AWS credentials каждые 50 минут.
-    // Cognito-токен живёт ~60 минут. Обновляем за 10 минут до истечения,
-    // чтобы никогда не получать Forbidden при опросе устройства.
-    // Обновляются только две функции AWS-части — логин и SSO не трогаем.
+    // Обновление AWS credentials каждые 50 минут
     if (!this.api._credRefreshStarted) {
       this.api._credRefreshStarted = true;
-
-      setInterval(async () => {
-        this.log.info('🔑 Refreshing AWS credentials...');
-        try {
-          await this.api.fetchAwsCredentials();
-          await this.api.setupIot();
-          this.log.info('✅ AWS credentials refreshed');
-        } catch (err) {
-          const msg = err?.message || 'unknown error';
-          this.log.error('❌ Credentials refresh failed:', msg);
-          // Если не удалось — пробуем полный reAuth как запасной вариант
-          try {
-            await this.api.reAuth();
-          } catch (e) {
-            this.log.error('❌ Fallback reAuth also failed:', e?.message || 'unknown error');
-          }
-        }
-      }, 50 * 60 * 1000).unref(); // 50 минут
-
+      setInterval(() => this.api.refreshCredentials(), 50 * 60 * 1000).unref();
       this.log.info('⏱️ AWS credentials auto-refresh scheduled every 50 min');
     }
   }

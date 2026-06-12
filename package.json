@@ -1,6 +1,6 @@
 {
   "name": "homebridge-tcl-split-ac",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Homebridge plugin for TCL TAC-BR12INV inverter split AC",
   "main": "index.js",
   "keywords": [
